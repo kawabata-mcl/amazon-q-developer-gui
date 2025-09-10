@@ -21,6 +21,8 @@ ANSI_ESCAPE = re.compile(r"\x1B\[[0-9;?]*[ -/]*[@-~]")
 # Startup messages we may need to handle to get to the prompt quickly
 INIT_CTRL_C = re.compile(r"ctrl.?\+?c to start chatting", re.IGNORECASE)
 LEGACY_PROMPT = re.compile(r"Legacy profiles detected.*migrate", re.IGNORECASE)
+YNT_PROMPT_RE = re.compile(r"(?i)\[\s*y\s*/\s*n(?:\s*/\s*t)?\s*\]:")
+ALLOW_ACTION_PROMPT_RE = re.compile(r"(?i)Allow\s+this\s+action\?.*Use\s*'t'\s*to\s*trust")
 
 def _strip_ansi_all(text: str) -> str:
     """Strip common ANSI/terminal control sequences including CSI, OSC, and ESC7/ESC8."""
@@ -299,6 +301,25 @@ class QChatSession:
                         if first_emit:
                             to_emit = _remove_input_echo_once(to_emit, text)
                             first_emit = False
+                        # まず 'Allow this action?... Use 't' to trust' を検出
+                        allow_match = ALLOW_ACTION_PROMPT_RE.search(to_emit)
+                        if allow_match:
+                            before = to_emit[:allow_match.start()]
+                            before = _filter_transient_status(before)
+                            if before:
+                                yield before
+                            yield {"type": "permission", "prompt": to_emit[allow_match.start():].strip()}
+                            return
+                        # 権限確認プロンプトの検出（[y/n/t]:）
+                        perm_match = YNT_PROMPT_RE.search(to_emit)
+                        if perm_match:
+                            before = to_emit[:perm_match.start()]
+                            before = _filter_transient_status(before)
+                            if before:
+                                yield before
+                            # UI にボタンを出すイベントを通知
+                            yield {"type": "permission", "prompt": to_emit[perm_match.start():].strip()}
+                            return
                         # 一時的なステータス（Thinking など）を除去
                         to_emit = _filter_transient_status(to_emit)
                         if to_emit:
@@ -336,6 +357,78 @@ class QChatSession:
             except Exception as e:
                 yield f"\n[Error while reading output: {e}]\n"
                 self._log(f"ERROR: send_and_stream exception: {e}")
+                break
+
+    def send_permission_choice(self, choice: str) -> None:
+        """権限プロンプトに y/n/t を応答する。"""
+        if not self.proc:
+            return
+        try:
+            if self.proc.stdin:
+                self.proc.stdin.write(choice.strip() + "\n")
+                self.proc.stdin.flush()
+                self._log(f"PERMISSION: sent '{choice}'")
+        except Exception as e:
+            self._log(f"PERMISSION: failed to send '{choice}': {e}")
+
+    def stream_until_turn_end(self):
+        """入力を送らず、現在のターンの残りをストリーミングする。
+        権限プロンプトが出たら permission イベントを発火して戻る。
+        """
+        if not self.proc or not self._q:
+            raise RuntimeError("Chat session not started")
+        raw_buf = ""
+        cleaned_len_emitted = 0
+        saw_output = False
+        last_output_ts = time.time()
+        last_any_ts = time.time()
+        deadline = time.time() + 60
+        while True:
+            try:
+                chunk = self._q.get(timeout=1)
+                raw_buf += chunk
+                last_any_ts = time.time()
+                cleaned = _strip_ansi_all(raw_buf)
+                m = PROMPT_REGEX.search(cleaned)
+                end_idx = m.start() if m else len(cleaned)
+                if end_idx > cleaned_len_emitted:
+                    to_emit = cleaned[cleaned_len_emitted:end_idx]
+                    if to_emit:
+                        # まず 'Allow this action?... Use 't' to trust' を検出
+                        allow_match = ALLOW_ACTION_PROMPT_RE.search(to_emit)
+                        if allow_match:
+                            before = to_emit[:allow_match.start()]
+                            before = _filter_transient_status(before)
+                            if before:
+                                yield before
+                            yield {"type": "permission", "prompt": to_emit[allow_match.start():].strip()}
+                            return
+                        perm_match = YNT_PROMPT_RE.search(to_emit)
+                        if perm_match:
+                            before = to_emit[:perm_match.start()]
+                            before = _filter_transient_status(before)
+                            if before:
+                                yield before
+                            yield {"type": "permission", "prompt": to_emit[perm_match.start():].strip()}
+                            return
+                        to_emit = _filter_transient_status(to_emit)
+                        if to_emit:
+                            yield to_emit
+                            cleaned_len_emitted = end_idx
+                            if to_emit.strip():
+                                saw_output = True
+                                last_output_ts = time.time()
+                if m:
+                    if time.time() - last_any_ts > 0.5:
+                        break
+            except queue.Empty:
+                if saw_output and (time.time() - last_output_ts > 5.0):
+                    break
+                if time.time() > deadline:
+                    break
+                continue
+            except Exception as e:
+                yield f"\n[Error while reading output: {e}]\n"
                 break
 
 
@@ -451,6 +544,52 @@ def main():
         with st.chat_message(m["role"]):
             st.markdown(m["content"]) 
 
+    # Permission pending UI
+    pending = st.session_state.get("pending_permission")
+    if pending:
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            collected = pending.get("collected", "")
+            placeholder.markdown(collected)
+            st.info("許可が必要な操作です。Amazon Q がツールを使用しようとしています。以下から選択してください。")
+            if prompt := pending.get("prompt"):
+                st.code(prompt)
+            col1, col2, col3 = st.columns(3)
+            yes = col1.button("はい（この操作を許可）", key="perm_yes")
+            no = col2.button("いいえ（拒否）", key="perm_no")
+            trust = col3.button("このセッションで常に許可（信頼）", key="perm_trust")
+
+            def _continue_after_choice(choice: str):
+                sess.send_permission_choice(choice)
+                new_collected = collected
+                encountered_permission = False
+                for chunk in sess.stream_until_turn_end():
+                    if isinstance(chunk, dict) and chunk.get("type") == "permission":
+                        # 次の許可プロンプトに到達
+                        st.session_state["pending_permission"] = {
+                            "prompt": chunk.get("prompt", ""),
+                            "collected": new_collected,
+                        }
+                        st.rerun()
+                        return
+                    else:
+                        new_collected += chunk
+                        placeholder.markdown(new_collected)
+                # 追加の許可がなければメッセージを確定
+                st.session_state["messages"].append({"role": "assistant", "content": new_collected.strip()})
+                st.session_state["pending_permission"] = None
+                st.rerun()
+
+            if yes:
+                _continue_after_choice("y")
+            if no:
+                _continue_after_choice("n")
+            if trust:
+                _continue_after_choice("t")
+
+        # pending がある間は通常の入力を一時停止
+        st.stop()
+
     # Single chat input（下部のネイティブ入力のみ）
     def process_message(message: str):
         st.session_state["messages"].append({"role": "user", "content": message})
@@ -460,9 +599,16 @@ def main():
             placeholder = st.empty()
             collected = ""
             for chunk in sess.send_and_stream(message):
-                collected += chunk
-                placeholder.markdown(collected)
-            # 応答の一部を保存
+                if isinstance(chunk, dict) and chunk.get("type") == "permission":
+                    # 許可待ち状態に移行（この時点では確定させない）
+                    st.session_state["pending_permission"] = {"prompt": chunk.get("prompt", ""), "collected": collected}
+                    placeholder.markdown(collected)
+                    st.rerun()
+                    return
+                else:
+                    collected += chunk
+                    placeholder.markdown(collected)
+            # 応答の一部を保存（許可待ちが発生しなかった場合のみ）
             st.session_state["messages"].append({"role": "assistant", "content": collected.strip()})
 
     # チャット入力（シンプル）
