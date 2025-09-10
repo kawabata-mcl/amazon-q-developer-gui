@@ -25,6 +25,9 @@ LEGACY_PROMPT = re.compile(r"Legacy profiles detected.*migrate", re.IGNORECASE)
 YNT_PROMPT_RE = re.compile(r"(?i)\[\s*y\s*/\s*n(?:\s*/\s*t)?\s*\]:")
 ALLOW_ACTION_PROMPT_RE = re.compile(r"(?i)Allow\s+this\s+action\?.*Use\s*'t'\s*to\s*trust")
 
+# URL 検出用
+URL_RE = re.compile(r"https?://[\w\-\._~:/%#\?\[\]@!\$&'\(\)\*\+,;=]+")
+
 def _strip_ansi_all(text: str) -> str:
     """Strip common ANSI/terminal control sequences including CSI, OSC, and ESC7/ESC8."""
     if not text:
@@ -144,6 +147,148 @@ def _find_q_binary() -> Optional[str]:
         except Exception:
             continue
     return None
+
+
+def _check_login_status(timeout_sec: float = 5.0) -> bool:
+    """`q whoami` の結果からログイン状態を推定する。
+    - 正常終了かつ出力に 'not logged in' が含まれなければログイン済みとみなす。
+    - 非0終了コードやタイムアウトは未ログイン（または不明）として扱う。
+    """
+    q_path = _find_q_binary()
+    if not q_path:
+        return False
+    try:
+        res = subprocess.run([q_path, "whoami"], capture_output=True, text=True, timeout=timeout_sec)
+        out = _strip_ansi_all((res.stdout or "") + (res.stderr or "")).strip()
+        low = out.lower()
+        if res.returncode != 0:
+            return False
+        if "not logged" in low or "please run q login" in low:
+            return False
+        # 何らかのユーザー/プロファイル情報が返っていればログイン済みとみなす
+        return bool(out)
+    except Exception:
+        return False
+
+
+def _execute_q_login_and_stream(extra_args: Optional[List[str]] = None) -> str:
+    """`q login` を実行し、その標準出力を逐次収集して返す。
+    extra_args で `--license`, `--identity-provider`, `--region`, `--use-device-flow` などを付与可能。
+    UI 側でプレースホルダに逐次描画する想定。完了後、呼び出し元で `_check_login_status()` を再評価する。
+    """
+    q_path = _find_q_binary()
+    if not q_path:
+        return "q コマンドが見つかりません。インストールしてください。"
+    try:
+        env = os.environ.copy()
+        env.setdefault("TERM", "xterm-256color")
+        cmd = [q_path, "login"] + (extra_args or [])
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            encoding="utf-8",
+            env=env,
+        )
+        collected = ""
+        placeholder = st.empty()
+        with st.status("q login 実行中… ブラウザでの認証が求められる場合があります", state="running"):
+            if proc.stdout:
+                for line in iter(proc.stdout.readline, ""):
+                    if not line:
+                        break
+                    collected += line
+                    # URL を検出してリンクとして提示しやすいように整形
+                    plain = _strip_ansi_all(collected)
+                    # 直近の行を優先的に見せる
+                    urls = URL_RE.findall(plain)
+                    if urls:
+                        # クリックしやすいように末尾にリンク列を付与
+                        link_lines = "\n".join([f"[Open Login Link]({u})" for u in urls[-3:]])
+                        placeholder.markdown(plain + "\n\n" + link_lines)
+                    else:
+                        placeholder.markdown(plain)
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        return _strip_ansi_all(collected)
+    except Exception as e:
+        return f"q login 実行中にエラーが発生しました: {e}"
+
+
+def _execute_q_logout_and_stream() -> str:
+    """`q logout` を実行し、標準出力を逐次表示する。"""
+    q_path = _find_q_binary()
+    if not q_path:
+        return "q コマンドが見つかりません。インストールしてください。"
+    try:
+        env = os.environ.copy()
+        env.setdefault("TERM", "xterm-256color")
+        proc = subprocess.Popen(
+            [q_path, "logout"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            encoding="utf-8",
+            env=env,
+        )
+        collected = ""
+        placeholder = st.empty()
+        with st.status("q logout 実行中…", state="running"):
+            if proc.stdout:
+                for line in iter(proc.stdout.readline, ""):
+                    if not line:
+                        break
+                    collected += line
+                    placeholder.markdown(_strip_ansi_all(collected))
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        return _strip_ansi_all(collected)
+    except Exception as e:
+        return f"q logout 実行中にエラーが発生しました: {e}"
+
+
+def _render_sidebar_auth_buttons(logged_in: bool) -> None:
+    """サイドバー最上部にログイン/ログアウトボタンを描画（色付き）。"""
+    st.sidebar.markdown(
+        """
+<style>
+.q-side-btn {
+  display: block;
+  text-align: center;
+  padding: 8px 12px;
+  border-radius: 8px;
+  color: #000000;
+  font-weight: 600;
+  text-decoration: none;
+  border: 0;
+}
+.q-side-btn:link, .q-side-btn:visited, .q-side-btn:hover, .q-side-btn:active,
+a.q-side-btn, a.q-side-btn:link, a.q-side-btn:visited, a.q-side-btn:hover, a.q-side-btn:active {
+  color: #000000 !important;
+  text-decoration: none !important;
+}
+.q-side-btn:hover { opacity: 0.92; }
+.q-side-btn.q-login { background: #16a34a; }
+.q-side-btn.q-logout { background: #dc2626; }
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+    if logged_in:
+        st.sidebar.markdown('<a class="q-side-btn q-logout" href="?logout=1">ログアウト</a>', unsafe_allow_html=True)
+    else:
+        st.sidebar.markdown('<a class="q-side-btn q-login" href="?login_panel=1">ログイン</a>', unsafe_allow_html=True)
+
+def _render_login_button(logged_in: bool) -> None:
+    """(廃止) 以前の右上固定ボタン実装は使用しない。サイドバーへ移行。"""
+    return
 
 class QChatSession:
     def __init__(self, trust_fs_write: bool = False, trust_execute_bash: bool = False, q_log_level: str = "info", cwd: Optional[str] = None, debug: bool = DEBUG_MODE):
@@ -542,6 +687,72 @@ def main():
     # Sidebar controls
     render_env_status()
 
+    # 現在のログイン状態を評価
+    login_ok = _check_login_status()
+    st.session_state["q_logged_in"] = login_ok
+    # サイドバー最上部の色付きボタン（緑:ログイン/赤:ログアウト）
+    _render_sidebar_auth_buttons(login_ok)
+
+    # クエリパラメータでのログイン/ログアウトトリガ処理（色付きリンククリック時）
+    try:
+        qp = st.query_params
+        if qp.get("logout") == "1":
+            _ = _execute_q_logout_and_stream()
+            st.session_state["q_logged_in"] = _check_login_status()
+            st.session_state["login_panel"] = False
+            try:
+                st.query_params.pop("logout")
+            except Exception:
+                pass
+            st.rerun()
+        if qp.get("login_panel") == "1":
+            st.session_state["login_panel"] = True
+            try:
+                st.query_params.pop("login_panel")
+            except Exception:
+                pass
+            # rerunは不要
+    except Exception:
+        pass
+
+    # ログイン設定パネルの表示/実行
+    show_login_panel = bool(st.session_state.get("login_panel", False)) and not st.session_state.get("q_logged_in")
+    if show_login_panel:
+        with st.sidebar:
+            st.subheader("ログイン設定")
+            license_choice = st.radio("ライセンス", options=["free", "pro"], horizontal=True, index=0, help="Free=Builder ID / Pro=IAM Identity Center")
+            use_device = st.toggle("デバイスフローを使用 (--use-device-flow)", value=False)
+            idp = ""
+            region = ""
+            if license_choice == "pro":
+                idp = st.text_input("Identity Provider URL (--identity-provider)", placeholder="https://d-xxxxxxxxxx.awsapps.com/start")
+                region = st.text_input("Region (--region)", placeholder="us-east-1")
+            col_a, col_b = st.columns(2)
+            run_login = col_a.button("q login を実行")
+            close_panel = col_b.button("閉じる")
+            if close_panel:
+                st.session_state["login_panel"] = False
+                st.rerun()
+            if run_login:
+                args: List[str] = []
+                if license_choice in ("free", "pro"):
+                    args += ["--license", license_choice]
+                if license_choice == "pro":
+                    if idp.strip():
+                        args += ["--identity-provider", idp.strip()]
+                    if region.strip():
+                        args += ["--region", region.strip()]
+                if use_device:
+                    args.append("--use-device-flow")
+
+                st.info("q login を実行します。ブラウザの認証画面が開く場合があります。")
+                _ = _execute_q_login_and_stream(args)
+                # 実行後、状態更新
+                st.session_state["q_logged_in"] = _check_login_status()
+                # login_panel を閉じてリロード
+                st.session_state["login_panel"] = False
+                st.rerun()
+
     st.sidebar.subheader("Trust 設定")
     opt_fs_write = st.sidebar.toggle("ファイル書き込みを許可 (fs_write)", value=False, help="ファイルの作成・変更を Q に許可します。")
     opt_execute_bash = st.sidebar.toggle("シェル実行を許可 (execute_bash)", value=False, help="外部コマンドの実行を Q に許可します。慎重に有効化してください。")
@@ -568,6 +779,10 @@ def main():
         cwd=effective_cwd,
     )
 
+    # 未ログインなら、チャット送信をブロックして案内
+    if not st.session_state.get("q_logged_in"):
+        st.warning("未ログインです。右上の『ログイン』ボタンから `q login` を実行してください。")
+
     if st.sidebar.button("セッション再起動"):
         try:
             sess.close()
@@ -583,6 +798,9 @@ def main():
     if opt_execute_bash:
         trust_summary.append("execute_bash")
     st.info("現在の信頼ツール: " + ", ".join(trust_summary))
+    # ログイン状態の一言
+    logged_in_badge = "✅ ログイン済み" if st.session_state.get("q_logged_in") else "⚠️ 未ログイン (右上のボタンから)"
+    st.caption(logged_in_badge)
     st.caption(f"作業ディレクトリ: {effective_cwd}")
 
     # Initialize chat history
