@@ -18,3 +18,29 @@ docs/
 
 # Logs
 logs/
+
+# Build artifacts (PyInstaller / streamlit-desktop-app)
+dist/
+build/
+*.spec
+
+dmg-work/
+AmazonQDesktop-Installer.dmg
+
+# Vendor-resolved binaries (fetched at build time)
+vendor/
+
+# Tooling / caches
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+
+# Editors/IDE
+.vscode/
+.idea/
+
+# Env files
+.env
+.env.*

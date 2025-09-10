@@ -1,2 +1,4 @@
 streamlit>=1.35.0
 pexpect>=4.9.0
+streamlit-desktop-app>=0.3.4
+pyinstaller>=6.15.0

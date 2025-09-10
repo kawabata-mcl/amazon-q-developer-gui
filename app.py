@@ -4,6 +4,7 @@ import time
 import shutil
 import subprocess
 from typing import List, Optional
+import sys
 
 import streamlit as st
 import threading
@@ -111,6 +112,39 @@ def _normalize_path(path: Optional[str]) -> str:
         # フォールバックは既定ディレクトリ
         return os.path.abspath(base_default)
 
+def _find_q_binary() -> Optional[str]:
+    """バンドル済み q バイナリを含む複数の候補から最初に見つかったものを返す。
+    優先順位: 環境変数(Q_BINARY) > PATH の q > バンドル付近の q。
+    """
+    q_env = os.environ.get("Q_BINARY")
+    if q_env and os.path.isfile(q_env) and os.access(q_env, os.X_OK):
+        return q_env
+    q_path = shutil.which("q")
+    if q_path:
+        return q_path
+    candidates = []
+    try:
+        exec_dir = os.path.dirname(sys.executable)
+    except Exception:
+        exec_dir = None
+    file_dir = os.path.dirname(os.path.abspath(__file__))
+    meipass = getattr(sys, "_MEIPASS", None)
+    for base in [exec_dir, file_dir, meipass]:
+        if not base:
+            continue
+        candidates.append(os.path.join(base, "q"))
+        candidates.append(os.path.join(base, "bin", "q"))
+        candidates.append(os.path.join(base, "Resources", "q"))
+        candidates.append(os.path.join(base, "..", "Resources", "q"))
+    for cand in candidates:
+        try:
+            cand_abs = os.path.abspath(cand)
+            if os.path.isfile(cand_abs) and os.access(cand_abs, os.X_OK):
+                return cand_abs
+        except Exception:
+            continue
+    return None
+
 class QChatSession:
     def __init__(self, trust_fs_write: bool = False, trust_execute_bash: bool = False, q_log_level: str = "info", cwd: Optional[str] = None, debug: bool = DEBUG_MODE):
         self.trust_fs_write = trust_fs_write
@@ -169,7 +203,8 @@ class QChatSession:
 
         # Spawn q chat as a background process (no pseudo-TTY)
         os.makedirs(self.cwd, exist_ok=True)
-        cmd = ["q"] + args
+        q_bin = _find_q_binary() or "q"
+        cmd = [q_bin] + args
         self.proc = subprocess.Popen(
             cmd,
             cwd=self.cwd,
@@ -446,7 +481,6 @@ class QChatSession:
                 break
 
 
-
 def get_or_create_session(trust_fs_write: bool, trust_execute_bash: bool, q_log_level: str, cwd: str) -> QChatSession:
     sess: Optional[QChatSession] = st.session_state.get("qchat_session")
     if (
@@ -476,16 +510,16 @@ def get_or_create_session(trust_fs_write: bool, trust_execute_bash: bool, q_log_
 
 def render_env_status() -> None:
     st.sidebar.subheader("環境状態")
-    q_path = shutil.which("q")
+    q_path = _find_q_binary()
     if not q_path:
-        st.sidebar.error("q コマンドが見つかりません。Amazon Q Developer CLI をインストールしてください。")
+        st.sidebar.error("同梱/環境の q コマンドが見つかりません。Amazon Q Developer CLI を用意してください。")
         st.stop()
     else:
         st.sidebar.success(f"q: {q_path}")
         # Optional: show version and identity
         try:
-            ver = subprocess.run(["q", "--version"], capture_output=True, text=True, timeout=5)
-            who = subprocess.run(["q", "whoami"], capture_output=True, text=True, timeout=5)
+            ver = subprocess.run([q_path, "--version"], capture_output=True, text=True, timeout=5)
+            who = subprocess.run([q_path, "whoami"], capture_output=True, text=True, timeout=5)
             if ver.stdout:
                 st.sidebar.caption(ver.stdout.strip())
             if who.stdout:
@@ -558,7 +592,7 @@ def main():
     # Render history（すべて表示）
     for m in st.session_state["messages"]:
         with st.chat_message(m["role"]):
-            st.markdown(m["content"]) 
+            st.markdown(m["content"])
 
     # Permission pending UI
     pending = st.session_state.get("pending_permission")
