@@ -97,13 +97,27 @@ def _remove_input_echo_once(text: str, user_text: str) -> str:
             return text.replace(c, "", 1)
     return text
 
+def _normalize_path(path: Optional[str]) -> str:
+    """ユーザー入力のパスを正規化して絶対パスへ（~ と環境変数を展開）。"""
+    base_default = os.path.join(os.path.expanduser("~"), "amazon-q")
+    if not path:
+        return os.path.abspath(base_default)
+    try:
+        p = os.path.expanduser(path.strip())
+        p = os.path.expandvars(p)
+        p = os.path.abspath(p)
+        return p
+    except Exception:
+        # フォールバックは既定ディレクトリ
+        return os.path.abspath(base_default)
+
 class QChatSession:
     def __init__(self, trust_fs_write: bool = False, trust_execute_bash: bool = False, q_log_level: str = "info", cwd: Optional[str] = None, debug: bool = DEBUG_MODE):
         self.trust_fs_write = trust_fs_write
         self.trust_execute_bash = trust_execute_bash
         self.q_log_level = q_log_level
         # 実行ディレクトリ（未指定時は ~/amazon-q を利用）
-        self.cwd: str = cwd or os.path.join(os.path.expanduser("~"), "amazon-q")
+        self.cwd: str = _normalize_path(cwd or os.path.join(os.path.expanduser("~"), "amazon-q"))
         self.proc: Optional[subprocess.Popen] = None
         self._q: Optional[queue.Queue] = None  # 出力統合キュー（stdout/stderr）
         self._threads: List[threading.Thread] = []
@@ -506,6 +520,8 @@ def main():
         help="既定は ~/amazon-q。存在しない場合は自動作成されます。",
     )
     st.session_state["cwd"] = cwd_input
+    effective_cwd = _normalize_path(cwd_input)
+    st.session_state["cwd_effective"] = effective_cwd
 
     st.sidebar.subheader("Q 設定")
     q_log_level = st.sidebar.selectbox("Q_LOG_LEVEL", options=["error", "warn", "info", "debug", "trace"], index=2)
@@ -515,7 +531,7 @@ def main():
         trust_fs_write=opt_fs_write,
         trust_execute_bash=opt_execute_bash,
         q_log_level=q_log_level,
-        cwd=cwd_input,
+        cwd=effective_cwd,
     )
 
     if st.sidebar.button("セッション再起動"):
@@ -533,7 +549,7 @@ def main():
     if opt_execute_bash:
         trust_summary.append("execute_bash")
     st.info("現在の信頼ツール: " + ", ".join(trust_summary))
-    st.caption(f"作業ディレクトリ: {cwd_input}")
+    st.caption(f"作業ディレクトリ: {effective_cwd}")
 
     # Initialize chat history
     if "messages" not in st.session_state:
