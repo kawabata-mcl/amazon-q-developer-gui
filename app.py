@@ -34,6 +34,46 @@ def _strip_ansi_all(text: str) -> str:
     s = s.replace("\x1B7", "").replace("\x1B8", "")
     return s
 
+def _filter_transient_status(text: str) -> str:
+    """一時的なステータス（Thinking スピナー等）を非表示にする。
+    以下のような出力を削除対象とする：
+    - "Thinking..." / "Thinking…" のみ、またはそれが繰り返された行
+    - 単一文字の断片（t h i n k g など）に句読点のみが付いた行
+    - 先頭の箇条書き記号（•, -, * , ·）や空白を許容
+    実テキストはストリーム断片で渡ってくる可能性があるため、行単位で判定する。
+    """
+    if not text:
+        return text
+    # まずは行内に埋め込まれたスピナー + Thinking トークン列を一括除去
+    # 例: "⠋ Thinking... ⠙ Thinking... ⠹ Thinking... > AWS..."
+    p_inline_seq = re.compile(r"(?i)(?:[\u2800-\u28FF•]*\s*Thinking(?:\s*(?:\.{3}|…|[.!?]))+\s*)+>?\s*")
+    text = p_inline_seq.sub("", text)
+
+    lines = text.splitlines(keepends=True)
+    out_lines = []
+    # パターン: Thinking... がスペース・句読点で区切られて繰り返されるだけの行
+    p_thinking = re.compile(r"^(?:[ \t•\-\*·]*Thinking(?:[ \t]*[\.…!]+)?[ \t]*)+$", re.IGNORECASE)
+    # パターン: thinking の文字断片のみ（1〜10 文字）に句読点が付いただけの行
+    p_frag = re.compile(r"^[ \t•\-\*·]*[tThHiInNkKgG]{1,10}[ \t\.·…!]*$")
+    # パターン: ブロック点字(⠋など)のみのスピナー行
+    p_braille = re.compile(r"^[ \t\u2800-\u28FF•·\-\*\.…!>]+$")
+    for ln in lines:
+        core = _strip_ansi_all(ln).strip()
+        if not core:
+            out_lines.append(ln)
+            continue
+        if p_thinking.match(core):
+            continue
+        if p_frag.match(core):
+            continue
+        if p_braille.match(core):
+            continue
+        out_lines.append(ln)
+    cleaned = "".join(out_lines)
+    # 連続改行を圧縮
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned
+
 def _remove_input_echo_once(text: str, user_text: str) -> str:
     """最初のチャンクに含まれる可能性がある入力エコーを一度だけ取り除く。
     フィルタは最小限（他の文言は非表示にしない）。
@@ -259,6 +299,8 @@ class QChatSession:
                         if first_emit:
                             to_emit = _remove_input_echo_once(to_emit, text)
                             first_emit = False
+                        # 一時的なステータス（Thinking など）を除去
+                        to_emit = _filter_transient_status(to_emit)
                         if to_emit:
                             yield to_emit
                             cleaned_len_emitted = end_idx
@@ -321,9 +363,7 @@ def get_or_create_session(trust_fs_write: bool, trust_execute_bash: bool, q_log_
         banner = sess.start()
         st.session_state["qchat_session"] = sess
         st.session_state.setdefault("messages", [])
-        # 初期出力をそのまま履歴に追加（非表示にしない）
-        if banner and banner.strip():
-            st.session_state["messages"].append({"role": "assistant", "content": banner.strip()})
+        # 初期出力（MCP初期化や案内文など）はUIには表示しない
     return sess
 
 
