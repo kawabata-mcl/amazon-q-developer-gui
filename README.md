@@ -47,6 +47,16 @@ Q_BINARY_URL="https://desktop-release.q.us-east-1.amazonaws.com/latest/Amazon%20
 # 生成物: AmazonQDesktop-Installer.dmg
 ```
 
+### DMG の見た目・アイコンについて
+- アプリのアイコンは `images/AmazonQDeveloperGui.png` から自動的に `.icns` を生成し、.app に適用されます（macOS の `sips` と `iconutil` コマンドが必要）。
+- DMG のウィンドウは、左側にアプリ、右側に `Applications` エイリアスが配置され、ドラッグ＆ドロップによるインストールが分かりやすい表示になります。
+- DMG の背景画像をカスタマイズしたい場合は、`images/dmg-background.png` を用意してください。存在する場合に自動的に適用されます。
+
+### インストール方法（エンドユーザー向け）
+1. 生成された `AmazonQDesktop-Installer.dmg` を開きます。
+2. 表示されたウィンドウで、`AmazonQDesktop.app` を右側の `Applications` フォルダへドラッグ＆ドロップします。
+3. コピー完了後、`/Applications` から `AmazonQDesktop` を起動してください。
+
 ## ローカル開発（任意）
 ```bash
 python3 -m venv venv

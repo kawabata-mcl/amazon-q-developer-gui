@@ -14,6 +14,44 @@ VENDOR_Q="${VENDOR_DIR}/q"
 RESOLVED_Q=""
 TARGET_ARCH="$(uname -m)"   # arm64 / x86_64
 
+# 指定 PNG から .icns を生成して ICON_PATH に設定
+_ensure_icns() {
+  local png_src="${ROOT_DIR}/images/AmazonQDeveloperGui.png"
+  local icns_out="${ROOT_DIR}/images/AmazonQDeveloperGui.icns"
+  if [ -f "$icns_out" ]; then
+    ICON_PATH="$icns_out"
+    return 0
+  fi
+  if [ ! -f "$png_src" ]; then
+    echo "[WARN] アイコン PNG が見つかりませんでした: $png_src"
+    return 0
+  fi
+  # sips と iconutil がある環境のみ生成
+  if ! command -v sips >/dev/null 2>&1 || ! command -v iconutil >/dev/null 2>&1; then
+    echo "[WARN] sips または iconutil が見つからないため .icns 生成をスキップします (macOS での実行を想定)。"
+    return 0
+  fi
+  local setdir
+  setdir="$(mktemp -d)" || return 0
+  trap "rm -rf '$setdir'" RETURN
+  setdir="$setdir/AmazonQDeveloperGui.iconset"
+  mkdir -p "$setdir"
+  # 必要各サイズへリサイズ
+  local sizes=(16 32 64 128 256 512 1024)
+  for sz in "${sizes[@]}"; do
+    sips -z "$sz" "$sz" "$png_src" --out "$setdir/icon_${sz}x${sz}.png" >/dev/null
+    local dsz=$((sz*2))
+    sips -z "$dsz" "$dsz" "$png_src" --out "$setdir/icon_${sz}x${sz}@2x.png" >/dev/null
+  done
+  iconutil -c icns "$setdir" -o "$icns_out"
+  if [ -f "$icns_out" ]; then
+    echo "[INFO] .icns 生成: $icns_out"
+    ICON_PATH="$icns_out"
+  else
+    echo "[WARN] .icns 生成に失敗しました"
+  fi
+}
+
 _arch_ok() {
   local bin="$1"
   # 'file' 出力に対象アーキが含まれていればOK（universal2なども許容）
@@ -135,8 +173,13 @@ PYI_OPTS=(
   --add-binary "${RESOLVED_Q}:."
 )
 
-if [ -n "$ICON_PATH" ]; then
+# .icns を用意してアイコンに設定
+_ensure_icns || true
+if [ -n "$ICON_PATH" ] && [ -f "$ICON_PATH" ]; then
   PYI_OPTS+=( --icon "$ICON_PATH" )
+  echo "[INFO] アイコン設定: $ICON_PATH"
+else
+  echo "[INFO] アイコン未設定（.icns が見つからないため）"
 fi
 
 # ビルド実行
