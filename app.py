@@ -13,7 +13,7 @@ from datetime import datetime
 
 # ===== Debug settings =====
 # コード上の変数で切り替え可能なデバッグモード（UIからは変更しない）
-DEBUG_MODE: bool = True  # True にすると詳細ログを出力
+DEBUG_MODE: bool = False  # True にすると詳細ログを出力
 DEBUG_LOG_DIR: str = os.path.join(os.path.expanduser("."), "logs")
 
 # プロンプトは環境により 'Amazon Q>' または '>' の場合がある（行全体がプロンプトで終わる想定）
