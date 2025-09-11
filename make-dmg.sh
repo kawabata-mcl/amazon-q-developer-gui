@@ -54,44 +54,52 @@ hdiutil create -volname "$VOLUME_NAME" -srcfolder "$WORK_DIR" -ov -format UDRW "
 MNT_DIR="$(mktemp -d)"
 hdiutil attach -mountpoint "$MNT_DIR" -nobrowse -quiet "${APP_NAME}-temp.dmg"
 
-# AppleScript で Finder ウィンドウの見た目を調整
-osascript <<OSA
+# マウント直後は Finder がディスクを認識していないことがあるため少し待機
+sleep 1 || true
+
+# AppleScript で Finder ウィンドウの見た目を調整（ボリューム名ではなくマウントポイントのエイリアスを使用）
+if ! osascript <<OSA
 on run
   set dmgPath to POSIX file "$MNT_DIR"
   tell application "Finder"
-    tell disk "$VOLUME_NAME"
-      open
-      set current view of container window to icon view
-      set toolbar visible of container window to false
-      set statusbar visible of container window to false
-      set bounds of container window to {200, 200, 900, 600}
-      delay 0.2
-      tell icon view options of container window
-        set arrangement to not arranged
-        set icon size to 96
-      end tell
-      -- 背景画像があれば設定
-      try
-        if exists file ".background:background.png" then
-          set background picture of container window to file ".background:background.png"
-        end if
-      end try
-      -- アイコンの配置（ドラッグ方向を想定した並び）
-      try
-        set position of file "$APP_NAME.app" to {140, 200}
-      end try
-      try
-        set position of file "Applications" to {520, 200}
-      end try
-      update without registering applications
-      delay 0.5
-      close
-      open
-      delay 0.2
+    set theAlias to dmgPath as alias
+    open theAlias
+    set theWindow to container window of theAlias
+    set current view of theWindow to icon view
+    set toolbar visible of theWindow to false
+    set statusbar visible of theWindow to false
+    set bounds of theWindow to {200, 200, 900, 600}
+    delay 0.2
+    tell icon view options of theWindow
+      set arrangement to not arranged
+      set icon size to 96
     end tell
+    -- 背景画像があれば設定
+    try
+      if exists file ".background:background.png" then
+        set background picture of theWindow to file ".background:background.png"
+      end if
+    end try
+    -- アイコンの配置（ドラッグ方向を想定した並び）
+    try
+      set position of item "$APP_NAME.app" of theWindow to {140, 200}
+    end try
+    try
+      set position of item "Applications" of theWindow to {520, 200}
+    end try
+    update without registering applications
+    delay 0.5
+    try
+      close theWindow
+    end try
+    open theAlias
+    delay 0.2
   end tell
 end run
 OSA
+then
+  echo "[WARN] Finder レイアウト設定に失敗しましたが処理を継続します" >&2
+fi
 
 # ボリュームアイコン反映（SetFile があればカスタムアイコンフラグを立てる）
 if command -v SetFile >/dev/null 2>&1; then

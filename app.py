@@ -1,4 +1,6 @@
 import os
+import signal
+import atexit
 import re
 import time
 import shutil
@@ -15,6 +17,9 @@ from datetime import datetime
 # コード上の変数で切り替え可能なデバッグモード（UIからは変更しない）
 DEBUG_MODE: bool = False  # True にすると詳細ログを出力
 DEBUG_LOG_DIR: str = os.path.join(os.path.expanduser("."), "logs")
+
+# セッション API の互換性バージョン
+SESSION_API_VERSION: int = 1
 
 # プロンプトは環境により 'Amazon Q>' または '>' の場合がある（行全体がプロンプトで終わる想定）
 PROMPT_REGEX = re.compile(r"(?m)^\s*(?:Amazon Q\>|\>)\s*$")
@@ -295,6 +300,8 @@ class QChatSession:
         self.trust_fs_write = trust_fs_write
         self.trust_execute_bash = trust_execute_bash
         self.q_log_level = q_log_level
+        # 互換性バージョン（コード変更で再生成を促す）
+        self.api_version: int = SESSION_API_VERSION
         # 実行ディレクトリ（未指定時は ~/amazon-q を利用）
         self.cwd: str = _normalize_path(cwd or os.path.join(os.path.expanduser("~"), "amazon-q"))
         self.proc: Optional[subprocess.Popen] = None
@@ -360,6 +367,7 @@ class QChatSession:
             text=True,
             bufsize=1,
             encoding="utf-8",
+            start_new_session=True,
         )
 
         self._q = queue.Queue()
@@ -416,31 +424,47 @@ class QChatSession:
     def close(self) -> None:
         if self.proc is not None:
             try:
-                if self.proc.stdin:
+                # すでに終了していなければ、まずは最速でグレースフル終了を試みる
+                if self.proc.poll() is None and self.proc.stdin:
                     try:
                         self.proc.stdin.write("/quit\n")
                         self.proc.stdin.flush()
                     except Exception:
                         pass
-                # Give it a moment to exit gracefully
-                try:
-                    self.proc.wait(timeout=2)
-                except Exception:
-                    pass
+                    try:
+                        self.proc.wait(timeout=0.3)
+                    except Exception:
+                        pass
+                # まだ生きていればプロセスグループへ SIGTERM（start_new_session=True 前提）
                 if self.proc.poll() is None:
                     try:
-                        self.proc.terminate()
+                        pgid = os.getpgid(self.proc.pid)
+                        try:
+                            os.killpg(pgid, signal.SIGTERM)
+                        except Exception:
+                            self.proc.terminate()
                     except Exception:
-                        pass
+                        try:
+                            self.proc.terminate()
+                        except Exception:
+                            pass
                     try:
-                        self.proc.wait(timeout=2)
+                        self.proc.wait(timeout=0.5)
                     except Exception:
                         pass
+                # それでも残っていれば SIGKILL
                 if self.proc.poll() is None:
                     try:
-                        self.proc.kill()
+                        pgid = os.getpgid(self.proc.pid)
+                        try:
+                            os.killpg(pgid, signal.SIGKILL)
+                        except Exception:
+                            self.proc.kill()
                     except Exception:
-                        pass
+                        try:
+                            self.proc.kill()
+                        except Exception:
+                            pass
             finally:
                 self.proc = None
         if self._log_fp:
@@ -626,6 +650,38 @@ class QChatSession:
                 break
 
 
+# Streamlit はスクリプトを再実行するため、フック登録は一度だけ行う
+_SHUTDOWN_HOOKS_INSTALLED = False
+
+def _install_shutdown_hooks_once() -> None:
+    global _SHUTDOWN_HOOKS_INSTALLED
+    if _SHUTDOWN_HOOKS_INSTALLED:
+        return
+    def _cleanup():
+        try:
+            sess = st.session_state.get("qchat_session")
+            if sess:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    try:
+        atexit.register(_cleanup)
+    except Exception:
+        pass
+    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)):
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, lambda *_: (_cleanup(), sys.exit(0)))
+        except Exception:
+            # 一部環境では設定できない場合がある
+            pass
+    _SHUTDOWN_HOOKS_INSTALLED = True
+
+
 def get_or_create_session(trust_fs_write: bool, trust_execute_bash: bool, q_log_level: str, cwd: str) -> QChatSession:
     sess: Optional[QChatSession] = st.session_state.get("qchat_session")
     if (
@@ -634,6 +690,7 @@ def get_or_create_session(trust_fs_write: bool, trust_execute_bash: bool, q_log_
         or sess.trust_execute_bash != trust_execute_bash
         or sess.q_log_level != q_log_level
         or getattr(sess, "cwd", None) != cwd
+        or getattr(sess, "api_version", None) != SESSION_API_VERSION
     ):
         if sess is not None:
             try:
@@ -680,6 +737,7 @@ def render_env_status() -> None:
 
 
 def main():
+    _install_shutdown_hooks_once()
     st.set_page_config(page_title="Amazon Q Chat (CLI)", page_icon="🤖", layout="wide")
     st.title("Amazon Q Developer CLI チャット (対話モード)")
     st.caption("Streamlit から `q chat` を対話セッションとして利用します。デフォルトは fs_read のみ信頼。必要に応じて fs_write / execute_bash を有効化できます。")
@@ -866,16 +924,37 @@ def main():
         with st.chat_message("assistant"):
             placeholder = st.empty()
             collected = ""
-            for chunk in sess.send_and_stream(message):
-                if isinstance(chunk, dict) and chunk.get("type") == "permission":
-                    # 許可待ち状態に移行（この時点では確定させない）
-                    st.session_state["pending_permission"] = {"prompt": chunk.get("prompt", ""), "collected": collected}
-                    placeholder.markdown(collected)
-                    st.rerun()
+            def _stream_from_session(s: QChatSession):
+                nonlocal collected
+                for chunk in s.send_and_stream(message):
+                    if isinstance(chunk, dict) and chunk.get("type") == "permission":
+                        st.session_state["pending_permission"] = {"prompt": chunk.get("prompt", ""), "collected": collected}
+                        placeholder.markdown(collected)
+                        st.rerun()
+                        return True  # rerun
+                    else:
+                        collected += chunk
+                        placeholder.markdown(collected)
+                return False
+            try:
+                rerun = _stream_from_session(sess)
+                if rerun:
                     return
-                else:
-                    collected += chunk
-                    placeholder.markdown(collected)
+            except AttributeError:
+                # 古いインスタンス（メソッド未定義）。再生成して一度だけ再試行
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+                st.session_state.pop("qchat_session", None)
+                new_sess = get_or_create_session(
+                    trust_fs_write=opt_fs_write,
+                    trust_execute_bash=opt_execute_bash,
+                    q_log_level=q_log_level,
+                    cwd=effective_cwd,
+                )
+                if _stream_from_session(new_sess):
+                    return
             # 応答の一部を保存（許可待ちが発生しなかった場合のみ）
             st.session_state["messages"].append({"role": "assistant", "content": collected.strip()})
 
